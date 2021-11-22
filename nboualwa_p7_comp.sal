@@ -1,0 +1,299 @@
+load "spectral-analysis.lsp"
+load "spectral-process.lsp"
+
+;===================== FM OSCILLATION =======================
+
+; a vibrato function that begins gradually
+define function smooth-vibrato()
+  return pwl(0.5, 1, 0.9, 1, 1) * lfo(6)
+
+; adding amplitude control
+define function envelope-tone(p)
+  return pwl(0.1, 1, 0.8, 0.4, 1) *
+         fmosc(p, 10 * smooth-vibrato())
+
+; giving it a richer waveform
+define variable *mytable* =
+                sim(0.5 * build-harmonic(1, 2048),
+                    0.2 * build-harmonic(2, 2048),
+                    0.1 * build-harmonic(3, 2048),
+                    0.2 * build-harmonic(4, 2048),
+                    0.4 * build-harmonic(5, 2048),
+                    0.2 * build-harmonic(6, 2048),
+                    0.1 * build-harmonic(7, 2048))
+
+set *mytable* = list(*mytable*, hz-to-step(1.0), T)
+
+define function envelope-tone-2(p)
+  return pwl(0.2, 1, 0.9, 0.4, 1) *
+         fmosc(p, 10 * smooth-vibrato(), *mytable*)
+
+; adding a time varying filter to avoid the static spectrum
+define function filtered-tone(p, s: 1)
+  return lp(envelope-tone-2(p),
+            pwev(100, 0.5, 10000, 1, 100)) ~ s
+
+;; an amplitude-reduced version of the above function
+define function filtered-tone2(p, s: 1)
+  return lp(envelope-tone-2(p),
+            pwev(100, 0.5, 300, 1, 100)) ~ s
+
+;===================== LPC =======================
+
+;; Trying to recreate exact piano chords from Long Season
+;set cycle13-list = list(b4, g4, e4, c4)
+;set cycle2-list = list(b4, g4, d4, b3)
+             ;         b3, g4, e5, c6,
+              ;        b4, g4, d4, b5,
+               ;       b4, g4, d4, b5)
+;set pitch-pat1 = make-cycle(cycle13-list, for: 8),
+;    pitch-pat3 = make-cycle(cycle13-list, for: 4)
+;set pitch-pat2 = make-cycle(cycle2-list, for: 4)
+
+;; Piano repition: first part
+set cycle-list1 = list(b3, g3, e3, c3)
+set pitch-pat1 = make-cycle(cycle-list1)
+function pn(dynamic: 25, step: c4, duration: 1)
+  begin
+    return piano-note(dynamic, step, duration)
+  end
+set score1 = score-gen(name: quote(pn),
+                       score-len: 32,
+                       ioi: 0.15,
+                       dynamic: 30,
+                       step: next(pitch-pat1),
+                       duration: 1)
+
+;; Piano repitition: second part
+set cycle-list2 = list(b3, g3, d3, b2)
+set pitch-pat2 = make-cycle(cycle-list2)
+function pn(dynamic: 25, step: c4, duration: 1)
+  begin
+    return piano-note(dynamic, step, duration)
+  end
+set score2 = score-gen(name: quote(pn),
+                       score-len: 16,
+                       ioi: 0.15,
+                       dynamic: 30,
+                       step: next(pitch-pat2),
+                       duration: 1)
+
+;; Piano repitition: third part
+set cycle-list3 = list(b3, g3, e3, c3)
+set pitch-pat3 = make-cycle(cycle-list3)
+function pn(dynamic: 25, step: c4, duration: 1)
+  begin
+    return piano-note(dynamic, step, duration)
+  end
+set score3 = score-gen(name: quote(pn),
+                       score-len: 16,
+                       ioi: 0.15,
+                       dynamic: 30,
+                       step: next(pitch-pat3),
+                       duration: 1)
+
+;===================== CROSS-SYNTHESIS =======================
+
+function cross-synth-fn(src, frame, src2, count)
+  begin
+    with frame2 = sa-next(src2), mag
+    if null(frame2) then return nil
+    set mag = sa-magnitude(frame2)
+    set frame[0] *= mag[0]   ; DC component
+    loop
+      for i from 1 below length(frame) - 1 by 2
+      for j from 1
+      set frame[i] *= mag[j],       ; real and
+          frame[i + 1] *= mag[j]    ; imaginary parts of next harmonic
+    end
+    set frame[length(frame) - 1] *= frame2[length(frame2) - 1]   ; Nyquist component
+    if count % 100 = 0 then display "phase-fn", count
+    return list(frame, src2, count + 1)
+  end
+
+function sp-example-4(len)
+  begin
+    ;; you can modulate anything with the voice spectrum. Best are
+    ;; broad-band sounds including noise, buzz with many harmonics, 
+    ;; and chords. 
+        ; buzz(30, c3, const(0, 5)), 
+        ; "./rpd-cello.wav", 
+        ; noise(5)
+    with sa1 = sa-init(input: "./pa_pa_voice.wav",
+                       skip-period: (len / 4) / 44100.0, 
+                       fft-dur: len / 44100.0,
+                       window: :hann),
+         sa2 = sa-init(input: "./pa_pa_synth.wav",
+                       skip-period: (len / 4) / 44100.0,
+                       fft-dur: len / 44100.0,
+                       window: :hann),
+         ; here, sa2 will retain phase but will be modulated by amplitude of sa1
+         ; you can swap sa1 and sa2 and get a different effect
+         sp = sp-init(sa1, quote(cross-synth-fn), sa2, 0)
+    exec sa-info(sa1)
+    exec sa-info(sa2)
+    return sp-to-sound(sp) * pwl(0.6, 2, 19, 2, 20)
+  end
+
+;; this is added in through audacity, not included in the below code
+exec sp-example-4(512)
+
+;===================== GRANULAR SYNTHESIS =======================
+
+;; The file to process with granular synthesis is a global
+;; to save passing (probably) the same parameter to many
+;; thousands of grains
+variable *gs-filename* = "./pa_pa_synth.wav", ;; change to the input sound file
+         *granulate-score* ;; the computed score is saved here
+         
+;; FILE-GRAIN creates a grain sampled from a file
+;; Parameters:
+;;   FILENAME - the file to granulate (default is *gs-filename*)
+;;   OFFSET - the time in seconds where the grain will start (default is 0)
+;;   SPEED - samples are stretched by 1/SPEED, causing pitch shift
+;;      (default is 1 - no stretch), interpolation is linear, which is not
+;;      the highest quality, but granular synthesis tends to be noisy anyway
+;; Implicit parameters:
+;;   the nominal duration (stretch) controls the grain duration
+;;
+;; raised-cosine is an envelope used to fade the grain in and out
+;;
+define function file-grain(filename: *gs-filename*, offset: 0, speed: 1.0)
+  begin
+    with grain = s-read(filename, time-offset: offset, 
+                        dur: get-duration(1) * speed)
+    return to-mono((sound(grain) ~~ (1.0 / speed)) * raised-cosine())
+  end
+
+
+;; SINE-GRAIN creates a sinusoidal grain
+;; Parameters:
+;;   LOW - in steps, determines the fundamental frequency of 
+;;         the lowest pitch (default C4)
+;;   HIGH - in steps, determines the fundamental frequency of 
+;;         the highest pitch (default C6)
+;; Implicit parameters:
+;;   the nominal duration (stretch) controls the grain duration
+;;
+;; Grain pitch will be randomly selected between LOW and HIGH
+;; (Whether the pitches are from a continuous scale, chromatic scale,
+;;  i.e. integers, or some other scale is intentionally left to you,
+;;  the  implementor.)
+;;
+define function sine-grain(low: C4, high: C6)
+  begin
+    with incr = ((high - low) / 12) + 1
+    set p = real-random(0, incr) * 12 + low
+    return to-mono(sine(p) * raised-cosine())
+  end
+
+
+;; make-granulate-score makes a score of grains
+;; Grains are selected by scanning through the file from
+;; fileoffset to fileend, but the file location is perturbed
+;; by a random number in the range from 0 to randomness, and 
+;; grains are randomly omitted depending density.
+;;
+;; Parameters:
+;;   FILEOFFSET - where to start reading from the file (default 0s)
+;;   FILEEND - where to stop reading from the file (default 10s)
+;;   GRAIN-DUR - the duration of each grain (default 50ms)
+;;   IOI - spacing of overlapping output grains
+;;   STRETCH - stretch factor, resulting score duration is
+;;     approximately (FILEEND - FILEOFFSET) * STRETCH
+;;   DENSITY - fraction of grains that are inserted into score,
+;;     0 means none, 1 means all, default is 1
+;;   
+;; The output grains are uniformly spaced with an inter-onset
+;; interval of ioi. The file is scanned by adding ioi / stretch
+;; to the fileoffset for each grain, so if stretch > 1, the 
+;; file is scanned slowly and the output sounds stretched. If
+;; stretch < 1, the output will sound compressed in time.
+;;
+define function make-granulate-score(fileoffset: 0, 
+                                     randomness: 1, 
+                                     fileend: 10,
+                                     grain-dur: 0.05,
+                                     ioi: 0.025,
+                                     stretch: 1.0,
+                                     density: 1.0,
+                                     speed: 1,
+                                     sinegrain: #f,
+                                     low: c4,
+                                     high: c6)
+  loop
+    with score, score-time = 0
+    while fileoffset < fileend
+    if rrandom() <= density then
+      begin with offset = fileoffset + rrandom() * randomness
+        if sinegrain then
+          begin
+            ;; avoid reading anything beyond fileend
+            if offset + grain-dur <= fileend then
+              set score @= list(score-time, grain-dur, 
+                                list(quote(sine-grain),
+                                     :low, low,
+                                     :high, high))
+          end 
+        else 
+          begin              
+           if offset + grain-dur <= fileend then
+              set score @= list(score-time, grain-dur, 
+                                list(quote(file-grain),
+                                     :offset, fileoffset + rrandom() * randomness,
+                                     :speed, speed))
+          end
+      end
+    set score-time += ioi,
+        fileoffset += ioi / stretch
+    finally 
+      begin
+        display "score computed", length(score)
+        ;; KEEP THIS ASSIGNMENT!! (autograder wants to see the score)
+        set *granulate-score* = reverse(score)
+        return *granulate-score*
+      end
+  end 
+
+;; raised-cosine or "Hanning" window. The cosine is generated by LFO,
+;; so it is at the control sample rate (default = 2205 Hz). Since LFO is
+;; normally a sine, we set the initial phase to 270 to make it a negative
+;; cosine. The duration obeys the current stretch factor.
+function raised-cosine()
+  return 0.5 * (1 + lfo(1.0 / get-duration(1), 1, *sine-table*, 270))
+
+;; creates the granulated sound heard in the composition
+function gran-synth()
+  begin
+    return timed-seq(make-granulate-score(grain-dur: 0.1, ioi: 0.05, stretch: 3,
+                                randomness: 0, fileend: 20))
+  end
+
+;===================== CREATING THE COMPOSITION =======================
+
+;; This creates the main melody. The other two melodies (which were created 
+;; above) are detailed in the answers file.
+play seq(filtered-tone(c5, s: 3),
+         filtered-tone(e5, s: 3),
+         filtered-tone(g5, s: 3),
+         sim(filtered-tone(c5, s: 3),
+             filtered-tone(e5, s: 3),
+             filtered-tone(g5, s: 3)),
+         sim(filtered-tone(e5, s: 3), 
+             filtered-tone(g5, s: 3),
+             filtered-tone(a5, s: 3)),
+         sim(filtered-tone(e5, s: 3),
+             filtered-tone(c5, s: 3),
+             set-logical-stop(filtered-tone2(a6, s: 24) * pwl(0.5, 0.4, 23, 0.4, 24), 6)),
+         set-logical-stop(timed-seq(score1), 4.8),
+         set-logical-stop(timed-seq(score2), 2.4),
+         set-logical-stop(timed-seq(score3), 2.4),
+         set-logical-stop(timed-seq(score1), 4.8),
+         set-logical-stop(timed-seq(score2), 2.4),
+         set-logical-stop(timed-seq(score3), 2.4),
+         set-logical-stop(timed-seq(score1), 4.8),
+         set-logical-stop(timed-seq(score2), 2.4),
+         set-logical-stop(timed-seq(score3), 2.4),
+         set-logical-stop(timed-seq(score1), 4.8),
+         set-logical-stop(timed-seq(score2), 2.4),
+         set-logical-stop(timed-seq(score3), 2.4))
